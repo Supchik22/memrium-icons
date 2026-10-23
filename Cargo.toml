@@ -1,0 +1,16 @@
+[package]
+name = "memrium-icons"
+version = "0.1.0"
+edition = "2021"
+description = "An icon composer: layers, groups, Liquid Glass, blend modes, icon theme export."
+license = "MIT"
+repository = "https://github.com/Supchik22/memrium-icons"
+
+[[bin]]
+name = "memrium_icons"
+path = "src/main.rs"
+
+[dependencies]
+chebrium = { git = "https://github.com/Supchik22/chebrium" }
+memrium-de = { git = "https://github.com/Supchik22/memrium" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }

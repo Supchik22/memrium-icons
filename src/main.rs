@@ -6,7 +6,9 @@
 //!
 //!   memrium_icons [icon-name]
 
-use chebrium::app::{self, App, Config, Host, KeyEvent, Keysym, Modifiers};
+mod vector;
+
+use chebrium::app::{self, App, Config, Host, KeyEvent, Keysym, Modifiers, PointerEvt, PointerKind};
 use chebrium::appmenu::{Item, Menu};
 use chebrium::draw::Align;
 use chebrium::form::Form;
@@ -15,7 +17,7 @@ use chebrium::picture::Pic;
 use chebrium::ui::{inside, Cursor, Ui};
 use memrium_de::apps::{self, IconIndex};
 use memrium_de::colour::{hsv_to_rgb, parse_hex, rgb_to_hsv, to_hex};
-use memrium_de::icondoc::{self, Appearance, Background, Blend, Drop, FillKind, Glass, GlassMode, Gradient, IconDoc, Kind, Props, ShadowKind, Shape};
+use memrium_de::icondoc::{self, Patchable, Appearance, Background, Blend, Drop, FillKind, Blobs, Glass, GlassMode, Gradient, IconDoc, Kind, Props, ShadowKind, Shape};
 use memrium_de::iconrender::{self, import_svg, GlassTune, Renderer, SvgOp, GLASS_PRESETS};
 use memrium_de::wallpapers;
 use std::collections::{HashMap, HashSet};
@@ -56,7 +58,9 @@ enum PickTarget {
     LayerFill,
     GradFrom,
     GradTo,
-    TintColour,
+    GradBlob(usize),
+    IconTint,
+    Vec(vector::Target),
 }
 
 /// The colour picker popup: a square for saturation and value, a hue bar, a hex field and an eyedropper.
@@ -86,23 +90,50 @@ struct Job {
     doc: IconDoc,
     flat: bool,
     n: u32,
+    /// physical pixels per logical pixel, for the small copies
+    px: f32,
     tune: GlassTune,
     backdrop: Option<Arc<image::RgbaImage>>,
     /// the grid: what is behind each of the six looks
     behind: Vec<Arc<image::RgbaImage>>,
+    /// the tinted look is drawn in the colour of the icon
+    by_icon: bool,
     /// all six looks at the size of the overview, not the one look being edited
     grid: bool,
+    /// the small copies under the icon are wanted (not in the vector editor, which shows none)
+    small: bool,
 }
 
 enum Done {
-    One { version: u64, look: Appearance, img: image::RgbaImage, plain: Option<image::RgbaImage> },
-    Grid { version: u64, imgs: Vec<(Appearance, image::RgbaImage)> },
+    One { version: u64, look: Appearance, img: image::RgbaImage, small: Vec<(u32, image::RgbaImage)> },
+    Grid { version: u64, imgs: Vec<(GridLook, image::RgbaImage)> },
+}
+
+/// the sizes of the small copies under the icon on the stage, in logical pixels
+const SMALL: [u32; 7] = [128, 96, 64, 48, 32, 24, 16];
+
+/// The small copies, each drawn at its own size on the screen's pixels (not shrunk from a bigger picture, which blurs them).
+fn small_copies(r: &mut Renderer, doc: &IconDoc, look: Appearance, px: f32) -> Vec<(u32, image::RgbaImage)> {
+    SMALL.iter().map(|&n| (n, r.render(doc, look, ((n as f32 * px).round() as u32).max(8)))).collect()
 }
 
 /// The overview shows the looks in this order: the light ones above, the dark ones below.
-const GRID_ORDER: [Appearance; 6] = [Appearance::Default, Appearance::ClearLight, Appearance::TintedLight, Appearance::Dark, Appearance::ClearDark, Appearance::TintedDark];
+/// A look in the overview: the look, and whether the tinted one takes the colour of the icon (not the shell's accent).
+type GridLook = (Appearance, bool);
+const GRID_ORDER: [GridLook; 7] = [(Appearance::Default, false), (Appearance::ClearLight, false), (Appearance::TintedLight, false), (Appearance::TintedLight, true), (Appearance::Dark, false), (Appearance::ClearDark, false), (Appearance::TintedDark, false)];
+
+fn grid_label((look, by_icon): GridLook) -> &'static str {
+    if by_icon {
+        "Tinted by icon"
+    } else {
+        look.label()
+    }
+}
 /// the size of an icon in the overview
 const GRID_N: u32 = 180;
+/// the icons of the strip of looks along the bottom of the stage, and the height it takes with its labels
+const STRIP_N: f32 = 64.0;
+const STRIP_H: f32 = STRIP_N + 30.0;
 
 /// The picture of the icon on the stage and its smaller copies.
 struct Shown {
@@ -178,6 +209,8 @@ struct Composer {
     also: Vec<u32>,
     collapsed: HashSet<u32>,
     look: Appearance,
+    /// the tinted (light) look is drawn in the colour of each icon
+    by_icon: bool,
     backdrop: usize,
     undo: Vec<IconDoc>,
     redo: Vec<IconDoc>,
@@ -189,17 +222,19 @@ struct Composer {
     results: Option<Receiver<Done>>,
     /// grows with every change of the document
     version: u64,
-    sent: Option<(u64, Appearance)>,
+    sent: Option<(u64, Appearance, bool)>,
     shown: Option<Shown>,
     outline: Option<(u32, u64, Appearance, Arc<Pic>)>,
     thumbs: HashMap<u32, (u64, Arc<Pic>)>,
     picker: Option<Picker>,
+    /// the blob of a gradient the inspector edits
+    blob_sel: usize,
     big_rect: [f32; 4],
     rows: Vec<(u32, [f32; 4])>,
     drag: Option<Drag>,
     /// 0 the icon being edited, 1 all six looks side by side
     view: usize,
-    grid: Option<(u64, Vec<(Appearance, Arc<Pic>)>)>,
+    grid: Option<(u64, Vec<(GridLook, Arc<Pic>)>)>,
     grid_sent: Option<u64>,
     /// the flat version is shown: very plain glass
     flat: bool,
@@ -226,6 +261,8 @@ struct Composer {
     /// the window with the glass sliders: shown, where its top left is, and where it was grabbed
     glass_panel: bool,
     glass_pos: [f32; 2],
+    glass_scroll: f32,
+    glass_height: f32,
     glass_grab: Option<[f32; 2]>,
     /// the `.icon` folders of Apple's Icon Composer found on the Desktop and in Downloads
     apple_icons: Vec<std::path::PathBuf>,
@@ -235,14 +272,24 @@ struct Composer {
     live: bool,
     live_busy: Arc<AtomicBool>,
     live_pending: bool,
+    /// a change of the glass (it concerns every icon) is written into the theme by itself too
+    live_glass: bool,
     live_all_due: Option<std::time::Instant>,
     /// "Reset all icons" was pressed once and waits for a second press
     confirm_reset_all: bool,
-    grid_rects: Vec<(Appearance, [f32; 4])>,
+    grid_rects: Vec<(GridLook, [f32; 4])>,
+    /// physical pixels per logical pixel of the screen
+    px_scale: f32,
     cdrag: Option<CanvasDrag>,
     /// the box round the selection on the icon, relative to the icon's top left
     sel_box: Option<[f32; 4]>,
     save_due: bool,
+    /// the vector editor: its tool is on the stage's toolbox, and it edits the SVG of one layer
+    vec: vector::Editor,
+    vec_layer: Option<u32>,
+    vec_flushed: Option<std::time::Instant>,
+    /// the context menu of the canvas (right click): where it is and what is in it
+    vec_menu: Option<([f32; 2], Vec<Item>)>,
     build: Option<Build>,
     note: String,
     waker: Option<Arc<app::Waker>>,
@@ -351,6 +398,49 @@ fn swatch(ui: &mut Ui<'_>, f: &mut Form, label: &str, colour: Option<[f32; 3]>) 
     hov && ui.click
 }
 
+/// The rows that edit the blobs of a gradient: which blob, its colour, place and size, and adding or removing one. Gives
+/// whether anything changed and, when a swatch was pressed, the colour picker request (blob, colour, y of the row).
+fn blob_rows(ui: &mut Ui<'_>, f: &mut Form, blobs: &mut Blobs, sel: &mut usize) -> (bool, Option<(usize, [f32; 3], f32)>) {
+    let mut changed = false;
+    let mut ask = None;
+    *sel = (*sel).min((blobs.count as usize).saturating_sub(1));
+    if blobs.count == 0 {
+        f.note(ui, "No blobs yet.", true);
+    } else {
+        let step = f.stepper(ui, "Blob", &format!("{} of {}", *sel + 1, blobs.count));
+        if step != 0 {
+            *sel = (*sel as i32 + step).rem_euclid(blobs.count as i32) as usize;
+        }
+        let i = *sel;
+        let mut b = blobs.spots[i];
+        let y = f.y;
+        if swatch(ui, f, "Colour", Some(b.colour)) {
+            ask = Some((i, b.colour, y));
+        }
+        let (mut x, mut yy, mut size) = (b.at[0] * 100.0, b.at[1] * 100.0, b.size * 100.0);
+        f.slider(ui, "Left", &mut x, -20.0, 120.0, "%");
+        f.slider(ui, "Top", &mut yy, -20.0, 120.0, "%");
+        f.slider(ui, "Size", &mut size, 5.0, 150.0, "%");
+        b.at = [x / 100.0, yy / 100.0];
+        b.size = size / 100.0;
+        if b != blobs.spots[i] {
+            blobs.spots[i] = b;
+            changed = true;
+        }
+    }
+    let w = (f.cw - 110.0 - 8.0) / 2.0;
+    if ui.button([f.x + 110.0, f.y - 15.0, w, 30.0], "Add blob", false) && blobs.add() {
+        *sel = blobs.count as usize - 1;
+        changed = true;
+    }
+    if ui.button([f.x + 118.0 + w, f.y - 15.0, w, 30.0], "Remove", false) && blobs.count > 1 {
+        blobs.remove(*sel);
+        changed = true;
+    }
+    f.skip(36.0);
+    (changed, ask)
+}
+
 /// A row of one choice out of `all`, drawn as a segmented control with the label on its left.
 fn pick<T: Copy + PartialEq>(ui: &mut Ui<'_>, f: &mut Form, label: &str, value: &mut T, all: &[T], name: fn(T) -> &'static str) -> bool {
     ui.row(f.x, f.y, label);
@@ -429,6 +519,7 @@ impl Composer {
             also: Vec::new(),
             collapsed: HashSet::new(),
             look: Appearance::Default,
+            by_icon: false,
             backdrop: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -442,6 +533,7 @@ impl Composer {
             outline: None,
             thumbs: HashMap::new(),
             picker: None,
+            blob_sel: 0,
             big_rect: [0.0; 4],
             rows: Vec::new(),
             drag: None,
@@ -457,12 +549,15 @@ impl Composer {
             apple_icons: Vec::new(),
             glass_panel: false,
             glass_pos: [-1.0, 70.0],
+            glass_scroll: 0.0,
+            glass_height: 700.0,
             glass_grab: None,
             menu_open: None,
             menu_sub: Vec::new(),
             live: true,
             live_busy: Arc::new(AtomicBool::new(false)),
             live_pending: false,
+            live_glass: false,
             live_all_due: None,
             confirm_reset_all: false,
             wall_img: None,
@@ -474,9 +569,14 @@ impl Composer {
             backdrop_key: None,
             behind: None,
             grid_rects: Vec::new(),
+            px_scale: 1.0,
             cdrag: None,
             sel_box: None,
             save_due: false,
+            vec: vector::Editor::new(),
+            vec_layer: None,
+            vec_flushed: None,
+            vec_menu: None,
             build: None,
             note: String::new(),
             waker: None,
@@ -559,6 +659,11 @@ impl Composer {
         ((BIG as f32 * self.zoom).round() as u32).clamp(160, 640)
     }
 
+    /// The pixels of the picture on the stage: the icon is drawn as big as the screen shows it, never stretched
+    fn n_px(&self) -> u32 {
+        ((self.n() as f32 * self.px_scale).round() as u32).clamp(self.n(), 1600)
+    }
+
     /// New glass settings for every icon: kept, drawn again, and written into the theme a moment after the last change.
     fn apply_tune(&mut self, t: GlassTune) {
         if t == self.tune {
@@ -569,7 +674,12 @@ impl Composer {
         self.version += 1;
         self.thumbs.clear();
         self.outline = None;
-        self.live_all_due = Some(std::time::Instant::now());
+        // every icon of the shell is drawn again for a glass change: only when asked (the toggle, or Build icon theme)
+        if self.live_glass {
+            self.live_all_due = Some(std::time::Instant::now());
+        } else if self.live {
+            self.note = "Glass changed: press Build icon theme to show it in the shell.".into();
+        }
     }
 
     fn set_zoom(&mut self, z: f32) {
@@ -602,6 +712,151 @@ impl Composer {
             }
         }
         self.live_write(false);
+    }
+
+
+    // ------------------------------------------------------------------------------------------ the vector editor
+
+    /// A drawing tool is picked (the layer tool is the way the icon was always edited).
+    fn drawing(&self) -> bool {
+        self.vec.tool != vector::Tool::Layer
+    }
+
+    /// Pick the shape tool: the editor then opens the selected layer, or makes a drawing.
+    fn start_drawing(&mut self, tool: vector::Tool) {
+        self.cdrag = None;
+        self.vec.set_tool(tool);
+        self.vec_sync();
+    }
+
+    /// A layer that holds a drawing, made at the top of the icon (a new icon when none is open).
+    fn new_drawing(&mut self) {
+        let doc = self.doc.get_or_insert_with(|| IconDoc::new("new-icon"));
+        let id = doc.fresh_id();
+        let svg = vector::Drawing::default().to_svg();
+        let count = doc.nodes.len() + 1;
+        doc.nodes.push(icondoc::Node { id, name: format!("Drawing {count}"), kind: Kind::Layer(icondoc::Layer { svg, props: icondoc::Variants::new(Props::default()) }) });
+        self.sel = Some(Sel::Node(id));
+        self.also.clear();
+        self.touch();
+        self.sent = None;
+    }
+
+    /// Keep the editor on the layer that is selected, and on the SVG the layer holds (Undo changes it behind our back).
+    fn vec_sync(&mut self) {
+        let layer_svg = |d: &IconDoc, id: u32| match d.find(id).map(|n| &n.kind) {
+            Some(Kind::Layer(l)) => Some(l.svg.clone()),
+            _ => None,
+        };
+        let picked = match (self.sel, self.doc.as_ref()) {
+            (Some(Sel::Node(id)), Some(d)) => layer_svg(d, id).map(|s| (id, s)),
+            _ => None,
+        };
+        match picked {
+            Some((id, svg)) if self.vec_layer != Some(id) => {
+                self.vec.open(&svg);
+                self.vec_layer = Some(id);
+            }
+            Some((_, svg)) => {
+                if !self.vec.is_current(&svg) {
+                    self.vec.load(&svg);
+                }
+            }
+            // the background or a group was picked: that is edited as a whole, with the layer tool
+            None if self.vec_layer.is_some() && self.sel.is_some() => {
+                self.vec.set_tool(vector::Tool::Layer);
+                self.vec_layer = None;
+            }
+            None => {
+                self.vec_layer = None;
+                self.new_drawing();
+                if let (Some(Sel::Node(id)), Some(d)) = (self.sel, self.doc.as_ref()) {
+                    if let Some(svg) = layer_svg(d, id) {
+                        self.vec.open(&svg);
+                        self.vec_layer = Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write the drawing into its layer when it changed.
+    fn vec_flush(&mut self) {
+        if !self.vec.dirty {
+            return;
+        }
+        let svg = self.vec.commit();
+        if let (Some(id), Some(d)) = (self.vec_layer, self.doc.as_mut()) {
+            if let Some(Kind::Layer(l)) = d.find_mut(id).map(|n| &mut n.kind) {
+                l.svg = svg;
+                self.touch();
+            }
+        }
+    }
+
+    /// What the editor wants of the system clipboard: copy its SVG, or ask for the text to paste.
+    fn vec_clipboard(&mut self, host: &mut Host) {
+        if let Some(t) = self.vec.want_copy.take() {
+            host.copy = Some(t);
+        }
+        if std::mem::take(&mut self.vec.want_paste) {
+            host.paste = true;
+        }
+    }
+
+    /// The context menu of the canvas, drawn over everything while it is open.
+    fn draw_vec_menu(&mut self, ui: &mut Ui<'_>, w: f32, host: &mut Host) {
+        let Some((at, items)) = self.vec_menu.clone() else { return };
+        let est: f32 = items.iter().map(|i| if i.separator { 9.0 } else { 26.0 }).sum::<f32>() + 12.0;
+        let y = at[1].min(self.win[3] - est - 6.0).max(4.0);
+        let mut chosen = None;
+        let mut rects = vec![];
+        self.menu_panel(ui, &items, 0, at[0], y, w, &mut chosen, &mut rects);
+        if let Some(id) = chosen {
+            self.vec_menu = None;
+            self.menu_sub.clear();
+            self.vec.menu_action(id);
+            self.vec_clipboard(host);
+            self.vec_flush();
+        } else if ui.click && !rects.iter().any(|r| inside(ui.mouse, *r)) {
+            self.vec_menu = None;
+            self.menu_sub.clear();
+        }
+        host.redraw = true;
+    }
+
+    fn draw_vec_inspector(&mut self, ui: &mut Ui<'_>, area: [f32; 4]) {
+        if let Some((t, c, y)) = self.vec.panel(ui, area) {
+            self.open_picker(PickTarget::Vec(t), c, y);
+        }
+        self.vec_flush();
+    }
+
+    /// The vector editor over the icon on the stage: the canvas is the layer's own square as it is drawn on the icon.
+    fn vec_stage(&mut self, ui: &mut Ui<'_>, stage: [f32; 4], rect: [f32; 4]) {
+        self.vec_sync();
+        if !self.drawing() {
+            return;
+        }
+        let Some(id) = self.vec_layer else { return };
+        let Some((s, o, _)) = self.doc.as_ref().and_then(|d| Renderer::placement(d, self.look, id)) else { return };
+        let centre = [rect[0] + rect[2] / 2.0 + o[0] * rect[2], rect[1] + rect[3] / 2.0 + o[1] * rect[3]];
+        let side = rect[2] * s;
+        // a little room round the icon, to start a shape beside it and to grab handles that lie outside
+        let pad = 44.0;
+        let (x0, y0) = ((rect[0] - pad).max(stage[0]), (rect[1] - pad).max(stage[1]));
+        let (x1, y1) = ((rect[0] + rect[2] + pad).min(stage[0] + stage[2]), (rect[1] + rect[3] + pad).min(stage[1] + stage[3]));
+        let area = [x0, y0, x1 - x0, y1 - y0];
+        let (m, c) = (ui.mouse, ui.click);
+        if !inside(m, area) {
+            ui.click = false;
+        }
+        ui.push_clip(area);
+        self.vec.frame(ui, area, self.px_scale.max(1.0), centre, side);
+        ui.pop_clip();
+        ui.mouse = m;
+        ui.click = c;
+        self.vec_flush();
     }
 
     /// Every picked layer: the main one first, then the others.
@@ -675,6 +930,23 @@ impl Composer {
         }
     }
 
+    /// An edit of what the inspector shows (the settings of `id`): what changed in it is made in every picked layer too.
+    fn edit_props(&mut self, id: u32, p: Props) {
+        let Some(before) = self.props_of(id) else { return };
+        let patch = Props::diff(&before, &p);
+        let mut ids = self.picked();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        for other in ids {
+            if other == id {
+                self.set_props(id, p);
+            } else if let Some(q) = self.props_of(other) {
+                self.set_props(other, q.apply(&patch));
+            }
+        }
+    }
+
     fn set_background(&mut self, b: Background) {
         let look = self.look;
         let mut changed = false;
@@ -685,6 +957,23 @@ impl Composer {
             }
         }
         if changed {
+            self.touch();
+        }
+    }
+
+    /// The colour of the "tinted by icon" look: by hand, or None to find it from the layers again.
+    fn set_icon_tint(&mut self, c: Option<[f32; 3]>) {
+        let mut changed = false;
+        if let Some(d) = self.doc.as_mut() {
+            if d.icon_tint != c {
+                d.icon_tint = c;
+                changed = true;
+            }
+        }
+        if changed {
+            // (the look is shown on the stage as soon as its colour is chosen)
+            self.look = Appearance::TintedLight;
+            self.by_icon = true;
             self.touch();
         }
     }
@@ -744,29 +1033,32 @@ impl Composer {
     /// Start drawing the icon again when the document or the look changed: on the worker thread if there is one.
     fn request_render(&mut self) {
         let Some(doc) = self.doc.clone() else { return };
-        if self.sent != Some((self.version, self.look)) {
-            self.sent = Some((self.version, self.look));
+        let by_icon = self.by_icon && self.look == Appearance::TintedLight;
+        if self.sent != Some((self.version, self.look, by_icon)) {
+            self.sent = Some((self.version, self.look, by_icon));
             match &self.jobs {
                 Some(tx) => {
-                    let _ = tx.send(Job { version: self.version, look: self.look, doc: doc.clone(), flat: self.flat, n: self.n(), tune: self.tune, backdrop: self.behind.clone(), behind: Vec::new(), grid: false });
+                    let _ = tx.send(Job { version: self.version, look: self.look, doc: doc.clone(), flat: self.flat, n: self.n_px(), px: self.px_scale, tune: self.tune, backdrop: self.behind.clone(), behind: Vec::new(), by_icon, grid: false, small: true });
                 }
                 None => {
                     let mut r = Renderer::new();
                     r.flat = self.flat;
                     r.tune = self.tune;
                     r.backdrop = self.behind.clone();
-                    let img = r.render(&doc, self.look, self.n());
-                    let plain = r.backdrop.take().map(|_| r.render(&doc, self.look, 128));
-                    self.accept(Done::One { version: self.version, look: self.look, img, plain });
+                    r.tint_by_icon = by_icon;
+                    let img = r.render(&doc, self.look, self.n_px());
+                    r.backdrop = None;
+                    let small = small_copies(&mut r, &doc, self.look, self.px_scale);
+                    self.accept(Done::One { version: self.version, look: self.look, img, small });
                 }
             }
         }
         // the overview is only drawn while it is shown
-        if self.view == 1 && self.grid_sent != Some(self.version) {
+        if self.grid_sent != Some(self.version) {
             self.grid_sent = Some(self.version);
             match &self.jobs {
                 Some(tx) => {
-                    let _ = tx.send(Job { version: self.version, look: self.look, doc, flat: self.flat, n: GRID_N, tune: self.tune, backdrop: None, behind: self.grid_behind.clone().unwrap_or_default(), grid: true });
+                    let _ = tx.send(Job { version: self.version, look: self.look, doc, flat: self.flat, n: GRID_N, px: 1.0, tune: self.tune, backdrop: None, behind: self.grid_behind.clone().unwrap_or_default(), by_icon: false, grid: true, small: false });
                 }
                 None => {
                     let mut r = Renderer::new();
@@ -775,7 +1067,8 @@ impl Composer {
                     let behind = self.grid_behind.clone().unwrap_or_default();
                     let imgs = GRID_ORDER.iter().enumerate().map(|(k, l)| {
                         r.backdrop = behind.get(k).cloned();
-                        (*l, r.render(&doc, *l, GRID_N))
+                        r.tint_by_icon = l.1;
+                        (*l, r.render(&doc, l.0, GRID_N))
                     }).collect();
                     self.accept(Done::Grid { version: self.version, imgs });
                 }
@@ -786,13 +1079,12 @@ impl Composer {
     fn accept(&mut self, d: Done) {
         let pic = |img: &image::RgbaImage| Arc::new(Pic::from_rgba(img.width(), img.height(), img.as_raw()));
         match d {
-            Done::One { version, look, img, plain } => {
+            Done::One { version, look, img, small } => {
                 // a picture of an older document is shown until the newer one arrives, but not after a newer one has been shown
                 if self.shown.as_ref().is_some_and(|s| s.version > version) {
                     return;
                 }
-                let from = plain.as_ref().unwrap_or(&img);
-                let small = [128u32, 64, 48, 32].iter().map(|&n| (n, pic(&image::imageops::resize(from, n, n, image::imageops::FilterType::Lanczos3)))).collect();
+                let small = small.iter().map(|(n, img)| (*n, pic(img))).collect();
                 self.shown = Some(Shown { version, look, big: pic(&img), img, small });
             }
             Done::Grid { version, imgs } => {
@@ -1136,10 +1428,15 @@ impl Composer {
                 }
             }
             2 => {
-                // the main one is grouped, and the others go into that group
-                if let Some(&first) = ids.first() {
-                    if let Some(g) = d.group(first) {
-                        for &id in &ids[1..] {
+                // the one at the back is grouped and the others go into that group, from the back to the front, so that they
+                // keep the order they had (the order of the selection says nothing about it)
+                let mut order = Vec::new();
+                front_to_back(&d.nodes, &mut order);
+                order.retain(|id| ids.contains(id));
+                order.reverse();
+                if let Some(&back) = order.first() {
+                    if let Some(g) = d.group(back) {
+                        for &id in &order[1..] {
                             d.move_node(id, Drop::Into(g));
                         }
                         new_sel.push(g);
@@ -1295,8 +1592,9 @@ impl Composer {
             r.tune = tune;
             r.flat = flat;
             for look in GRID_ORDER {
-                let img = r.render(&doc, look, 1024);
-                let _ = img.save(out.join(format!("{}.png", look.label().to_lowercase().replace(' ', "-"))));
+                r.tint_by_icon = look.1;
+                let img = r.render(&doc, look.0, 1024);
+                let _ = img.save(out.join(format!("{}.png", grid_label(look).to_lowercase().replace(' ', "-"))));
             }
         });
     }
@@ -1341,6 +1639,7 @@ impl Composer {
         changed |= ui.segmented([stage[0] + 226.0, stage[1] + 14.0, 116.0, 28.0], &["Light", "Dark"], &mut mode);
         if changed {
             self.look = Appearance::from_parts(style, mode == 1);
+            self.by_icon = false;
             self.outline = None;
         }
         let mut x = stage[0] + 350.0;
@@ -1472,13 +1771,27 @@ impl Composer {
         let rect = self.big_rect;
         self.update_backdrop(rect);
         if let Some(s) = &self.shown {
-            ui.picture(rect, &s.big, [0.0, 0.0, big, big], 1.0);
+            ui.picture(rect, &s.big, [0.0, 0.0, s.img.width() as f32, s.img.height() as f32], 1.0);
         }
-        self.draw_outline(ui, rect);
+        self.vec.status.clear();
+        let toolbox_h = self.vec.toolbox(ui, stage[0] + 14.0, stage[1] + 56.0);
+        let _ = toolbox_h;
+        if self.drawing() {
+            self.vec_stage(ui, stage, rect);
+        } else {
+            self.draw_outline(ui, rect);
+        }
+        if !self.vec.status.is_empty() || self.drawing() {
+            let status = if self.vec.status.is_empty() { self.vec.hint() } else { self.vec.status.clone() };
+            let status = fit(ui, &status, 12.0, false, stage[2] - 250.0);
+            // (above the ruler when there is one)
+            let up = if self.vec.rulers && self.drawing() { 57.0 } else { 66.0 };
+            ui.text_raw(stage[0] + 72.0, stage[1] + up, &status, 12.0, false, sc, 0.65, Align::Left);
+        }
         if let Some(sh) = &self.shown {
             // and smaller, as it is used
             // (the row of controls along the bottom of the stage keeps its place)
-            let room = stage[1] + stage[3] - (by + big) - 30.0 - 50.0;
+            let room = stage[1] + stage[3] - (by + big) - 30.0 - 50.0 - STRIP_H;
             let sizes: Vec<&(u32, Arc<Pic>)> = sh.small.iter().filter(|(n, _)| *n as f32 <= room.max(40.0)).collect();
             if !sizes.is_empty() {
                 let total: f32 = sizes.iter().map(|(n, _)| *n as f32 + 28.0).sum::<f32>() - 28.0;
@@ -1486,12 +1799,15 @@ impl Composer {
                 let row_h = sizes[0].0 as f32;
                 for (n, pic) in sizes {
                     let f = *n as f32;
-                    ui.picture([sx, by + big + 20.0 + (row_h - f) / 2.0, f, f], pic, [0.0, 0.0, f, f], 1.0);
-                    sx += f + 28.0;
+                    ui.picture([sx, by + big + 20.0 + (row_h - f) / 2.0, f, f], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+                    sx += f + 24.0;
                 }
             }
         } else if self.doc.is_none() {
             ui.text(stage[0] + stage[2] / 2.0, by + big / 2.0, "Pick an icon in the Icons tab", 13.0, false, sc, 0.6, Align::Center);
+        }
+        if self.doc.is_some() {
+            self.draw_strip(ui, stage, sc);
         }
         self.eyedropper(ui);
     }
@@ -1552,7 +1868,7 @@ impl Composer {
             return;
         }
         self.backdrop_key = Some(key);
-        if let Some(part) = self.crop_behind(rect, self.n()) {
+        if let Some(part) = self.crop_behind(rect, self.n_px()) {
             self.behind = Some(part);
             self.version += 1;
         }
@@ -1648,14 +1964,57 @@ impl Composer {
     }
 
     /// The six looks of the icon side by side, drawn again as it changes. A click on one makes it the look being edited.
+    /// The row along the bottom of the stage with the icon in every look (light above in the overview, here light then dark);
+    /// a click takes a look to the stage.
+    fn draw_strip(&mut self, ui: &mut Ui<'_>, stage: [f32; 4], sc: [f32; 3]) {
+        let (accent, l, gap) = (ui.accent, STRIP_N, 22.0);
+        let total = 7.0 * l + 6.0 * gap;
+        let x0 = stage[0] + stage[2] / 2.0 - total / 2.0;
+        let y = stage[1] + stage[3] - 50.0 - 22.0 - l;
+        if x0 < stage[0] + 8.0 || y < self.big_rect[1] + self.big_rect[3] + 8.0 {
+            return;
+        }
+        let cells: Vec<[f32; 4]> = (0..7).map(|k| [x0 + k as f32 * (l + gap), y, l, l]).collect();
+        self.update_grid_behind(&cells);
+        self.grid_rects.clear();
+        let pics = self.grid.as_ref().map(|g| g.1.clone()).unwrap_or_default();
+        let mut chosen = None;
+        for (k, look) in GRID_ORDER.iter().enumerate() {
+            let r = cells[k];
+            self.grid_rects.push((*look, r));
+            let hit = [r[0] - 6.0, r[1] - 6.0, r[2] + 12.0, r[3] + 28.0];
+            let hov = ui.hit(hit);
+            if *look == (self.look, self.by_icon && self.look == Appearance::TintedLight) {
+                ui.fill(hit, 12.0, accent, 0.22);
+            } else if hov {
+                ui.fill(hit, 12.0, sc, 0.07);
+            }
+            if let Some((_, pic)) = pics.iter().find(|(lk, _)| lk == look) {
+                ui.picture(r, pic, [0.0, 0.0, GRID_N as f32, GRID_N as f32], 1.0);
+            }
+            ui.text(r[0] + r[2] / 2.0, r[1] + r[3] + 14.0, grid_label(*look), 10.5, *look == (self.look, self.by_icon && self.look == Appearance::TintedLight), sc, 0.8, Align::Center);
+            if hov {
+                ui.want_cursor(Cursor::Pointer);
+                if ui.click {
+                    chosen = Some(*look);
+                }
+            }
+        }
+        if let Some(lk) = chosen {
+            self.look = lk.0;
+            self.by_icon = lk.1;
+            self.outline = None;
+        }
+    }
+
     fn draw_grid(&mut self, ui: &mut Ui<'_>, stage: [f32; 4], sc: [f32; 3]) {
         self.grid_rects.clear();
         let accent = ui.accent;
         let avail_h = stage[3] - 56.0 - 52.0;
-        let cell = (GRID_N as f32).min(avail_h / 2.0 - 36.0).max(80.0);
-        let gap_x = ((stage[2] - 3.0 * cell) / 4.0).max(8.0);
+        let cell = (GRID_N as f32).min(avail_h / 2.0 - 36.0).min((stage[2] - 40.0) / 4.0 - 8.0).max(80.0);
+        let gap_x = ((stage[2] - 4.0 * cell) / 5.0).max(8.0);
         let top = stage[1] + 56.0 + (avail_h - 2.0 * (cell + 36.0)).max(0.0) / 2.0;
-        let cells: Vec<[f32; 4]> = (0..6).map(|k| [stage[0] + gap_x + (k % 3) as f32 * (cell + gap_x), top + (k / 3) as f32 * (cell + 36.0), cell, cell]).collect();
+        let cells: Vec<[f32; 4]> = (0..7).map(|k| [stage[0] + gap_x + (k % 4) as f32 * (cell + gap_x), top + (k / 4) as f32 * (cell + 36.0), cell, cell]).collect();
         self.update_grid_behind(&cells);
         let Some((_, pics)) = self.grid.clone() else {
             ui.text(stage[0] + stage[2] / 2.0, stage[1] + stage[3] / 2.0, "Drawing the looks…", 13.0, false, sc, 0.6, Align::Center);
@@ -1663,11 +2022,11 @@ impl Composer {
         };
         let mut chosen = None;
         for (k, look) in GRID_ORDER.iter().enumerate() {
-            let (col, row) = (k % 3, k / 3);
+            let (col, row) = (k % 4, k / 4);
             let r = [stage[0] + gap_x + col as f32 * (cell + gap_x), top + row as f32 * (cell + 36.0), cell, cell];
             self.grid_rects.push((*look, r));
             let hov = ui.hit([r[0] - 8.0, r[1] - 8.0, r[2] + 16.0, r[3] + 40.0]);
-            if *look == self.look {
+            if *look == (self.look, self.by_icon && self.look == Appearance::TintedLight) {
                 ui.fill([r[0] - 8.0, r[1] - 8.0, r[2] + 16.0, r[3] + 40.0], 14.0, accent, 0.22);
             } else if hov {
                 ui.fill([r[0] - 8.0, r[1] - 8.0, r[2] + 16.0, r[3] + 40.0], 14.0, sc, 0.07);
@@ -1675,7 +2034,7 @@ impl Composer {
             if let Some((_, pic)) = pics.iter().find(|(l, _)| l == look) {
                 ui.picture(r, pic, [0.0, 0.0, GRID_N as f32, GRID_N as f32], 1.0);
             }
-            ui.text(r[0] + r[2] / 2.0, r[1] + r[3] + 22.0, look.label(), 13.0, true, sc, 0.9, Align::Center);
+            ui.text(r[0] + r[2] / 2.0, r[1] + r[3] + 22.0, grid_label(*look), 13.0, true, sc, 0.9, Align::Center);
             if hov {
                 ui.want_cursor(Cursor::Pointer);
                 if ui.click {
@@ -1684,7 +2043,8 @@ impl Composer {
             }
         }
         if let Some(l) = chosen {
-            self.look = l;
+            self.look = l.0;
+            self.by_icon = l.1;
             self.view = 0;
             self.outline = None;
         }
@@ -1698,7 +2058,7 @@ impl Composer {
         let accent = ui.accent;
 
         // moving or scaling what is being dragged
-        let fit = 1.0 - 2.0 * doc.margin.clamp(0.0, 0.3);
+        let fit = iconrender::plate_fit();
         if let Some(cd) = &self.cdrag {
             if ui.held {
                 let (id, scale, from, start) = (cd.id, cd.scale, cd.from, cd.props);
@@ -1862,8 +2222,6 @@ impl Composer {
 
     fn draw_inspector(&mut self, ui: &mut Ui<'_>, area: [f32; 4]) {
         let (ink, accent) = (ui.ink, ui.accent);
-        self.panel_bg(ui, area);
-        ui.fill([area[0], area[1], 1.0, area[3]], 0.0, ink, 0.09);
         let x = area[0] + 20.0;
         let cw = area[2] - 40.0;
         let Some(doc) = self.doc.clone() else {
@@ -1970,15 +2328,39 @@ impl Composer {
                         f.skip(36.0);
                         match p.gradient {
                             Some(mut g) => {
-                                if swatch(ui, &mut f, "From", Some(g.a)) {
+                                let mut kind = if g.blobs.count > 0 { 2 } else { usize::from(g.radial) };
+                                ui.row(f.x, f.y, "Type");
+                                if ui.segmented([f.x + 110.0, f.y - 15.0, f.cw - 110.0, 30.0], &["Linear", "Radial", "Blobs"], &mut kind) {
+                                    g.radial = kind == 1;
+                                    if kind == 2 {
+                                        if g.blobs.count == 0 {
+                                            g.blobs = Blobs::starter(g.a, g.b);
+                                        }
+                                        self.blob_sel = 0;
+                                    } else {
+                                        g.blobs.count = 0;
+                                    }
+                                }
+                                f.skip(36.0);
+                                if swatch(ui, &mut f, if kind == 2 { "Base" } else { "From" }, Some(g.a)) {
                                     open = Some((PickTarget::GradFrom, g.a, f.y - 36.0));
                                 }
-                                if swatch(ui, &mut f, "To", Some(g.b)) {
-                                    open = Some((PickTarget::GradTo, g.b, f.y - 36.0));
-                                }
-                                f.toggle(ui, "Radial", &mut g.radial);
-                                if !g.radial {
-                                    f.slider(ui, "Angle", &mut g.angle, 0.0, 360.0, "°");
+                                if kind == 2 {
+                                    let (_, ask) = blob_rows(ui, &mut f, &mut g.blobs, &mut self.blob_sel);
+                                    if let Some((i, c, y)) = ask {
+                                        open = Some((PickTarget::GradBlob(i), c, y));
+                                    }
+                                    // a gradient without blobs would turn back into a plain one: keep one
+                                    if g.blobs.count == 0 {
+                                        g.blobs.add();
+                                    }
+                                } else {
+                                    if swatch(ui, &mut f, "To", Some(g.b)) {
+                                        open = Some((PickTarget::GradTo, g.b, f.y - 36.0));
+                                    }
+                                    if kind == 0 {
+                                        f.slider(ui, "Angle", &mut g.angle, 0.0, 360.0, "°");
+                                    }
                                 }
                                 p.gradient = Some(g);
                             }
@@ -2017,7 +2399,7 @@ impl Composer {
                     f.slider(ui, "Move down", &mut p.offset[1], -0.5, 0.5, "");
                     f.slider(ui, "Scale", &mut p.scale, 0.2, 2.0, "×");
                     if p != before {
-                        self.set_props(id, p);
+                        self.edit_props(id, p);
                     }
                     // flip, turn and centre the drawing
                     let bw = (f.cw - 3.0 * 4.0) / 4.0;
@@ -2043,10 +2425,10 @@ impl Composer {
                 let mut b = before;
                 section_icon(ui, x, f.y - 4.0, "square-round-corner", "Plate");
                 f.skip(18.0);
-                pick(ui, &mut f, "Shape", &mut b.shape, Shape::ALL, Shape::label);
+                f.note(ui, "The plate shape is set for all icons in the glass panel.", false);
                 pick(ui, &mut f, "Fill", &mut b.fill, FillKind::ALL, FillKind::label);
-                if b.fill != FillKind::None {
-                    if swatch(ui, &mut f, if b.fill == FillKind::Solid { "Colour" } else { "Top" }, Some(b.top)) {
+                if matches!(b.fill, FillKind::Solid | FillKind::Gradient | FillKind::Auto) {
+                    if swatch(ui, &mut f, if matches!(b.fill, FillKind::Solid | FillKind::Auto) { "Colour" } else { "Top" }, Some(b.top)) {
                         open = Some((PickTarget::BgTop, b.top, f.y - 36.0));
                     }
                     if b.fill == FillKind::Gradient && swatch(ui, &mut f, "Bottom", Some(b.bottom)) {
@@ -2060,12 +2442,12 @@ impl Composer {
                 if b != before {
                     self.set_background(b);
                 }
-                self.document_rows(ui, &mut f, x, doc.margin, doc.tint, &mut open);
+                self.document_rows(ui, &mut f, x, &mut open);
             }
             None => {
                 f.note(ui, "Click a layer on the icon or in the list.", false);
                 f.note(ui, "Click the plate to change its shape and colour.", false);
-                self.document_rows(ui, &mut f, x, doc.margin, doc.tint, &mut open);
+                self.document_rows(ui, &mut f, x, &mut open);
             }
         }
         self.insp_height = f.y - start + 40.0;
@@ -2078,22 +2460,37 @@ impl Composer {
     }
 
     /// Settings of the whole icon: the empty border, the colour of the tinted looks.
-    fn document_rows(&mut self, ui: &mut Ui<'_>, f: &mut Form, x: f32, margin: f32, tint: [f32; 3], open: &mut Option<(PickTarget, [f32; 3], f32)>) {
+    fn document_rows(&mut self, ui: &mut Ui<'_>, f: &mut Form, x: f32, open: &mut Option<(PickTarget, [f32; 3], f32)>) {
         f.skip(8.0);
+        if let Some(doc) = self.doc.clone() {
+            section_icon(ui, x, f.y - 4.0, "pipette", "Tinted by icon");
+            f.skip(18.0);
+            let mut manual = doc.icon_tint.is_some();
+            f.toggle(ui, "Choose the colour myself", &mut manual);
+            if manual != doc.icon_tint.is_some() {
+                if manual {
+                    // starts from the colour found, so that nothing jumps
+                    let mut r = Renderer::new();
+                    r.cpu = true;
+                    let c = r.found_colour(&doc);
+                    self.set_icon_tint(Some(c));
+                } else {
+                    self.set_icon_tint(None);
+                }
+            }
+            if let Some(c) = self.doc.as_ref().and_then(|d| d.icon_tint) {
+                if swatch(ui, f, "Colour", Some(c)) {
+                    *open = Some((PickTarget::IconTint, c, f.y - 36.0));
+                }
+            } else {
+                f.note(ui, "The colour comes from the colours of the layers.", false);
+            }
+            f.skip(8.0);
+        }
         section_icon(ui, x, f.y - 4.0, "image", "Icon");
         f.skip(18.0);
-        let mut m = margin * 100.0;
-        f.slider(ui, "Border", &mut m, 0.0, 20.0, "%");
-        if (m / 100.0 - margin).abs() > 1e-4 {
-            if let Some(d) = self.doc.as_mut() {
-                d.margin = m / 100.0;
-            }
-            self.touch();
-        }
-        if swatch(ui, f, "Tint colour", Some(tint)) {
-            *open = Some((PickTarget::TintColour, tint, f.y - 36.0));
-        }
         f.toggle(ui, "Live in the shell", &mut self.live);
+        f.toggle(ui, "Glass changes too (all icons)", &mut self.live_glass);
         let w = (f.cw - 8.0) / 2.0;
         let fx = f.x;
         let row = |i: usize, y: f32| [fx + i as f32 * (w + 8.0), y - 12.0, w, 28.0];
@@ -2155,11 +2552,28 @@ impl Composer {
                     self.set_background(b);
                 }
             }
+            PickTarget::IconTint => self.set_icon_tint(Some(rgb)),
             PickTarget::LayerFill => {
                 if let Some(Sel::Node(id)) = self.sel {
                     if let Some(mut p) = self.props_of(id) {
                         p.fill = Some(rgb);
-                        self.set_props(id, p);
+                        self.edit_props(id, p);
+                    }
+                }
+            }
+            PickTarget::Vec(t) => {
+                self.vec.set_colour(t, rgb);
+                self.vec_flush();
+            }
+            PickTarget::GradBlob(i) => {
+                if let Some(Sel::Node(id)) = self.sel {
+                    if let Some(mut p) = self.props_of(id) {
+                        let mut g = p.gradient.unwrap_or_default();
+                        if i < g.blobs.count as usize {
+                            g.blobs.spots[i].colour = rgb;
+                        }
+                        p.gradient = Some(g);
+                        self.edit_props(id, p);
                     }
                 }
             }
@@ -2173,20 +2587,8 @@ impl Composer {
                             g.b = rgb;
                         }
                         p.gradient = Some(g);
-                        self.set_props(id, p);
+                        self.edit_props(id, p);
                     }
-                }
-            }
-            PickTarget::TintColour => {
-                let mut changed = false;
-                if let Some(d) = self.doc.as_mut() {
-                    if d.tint != rgb {
-                        d.tint = rgb;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.touch();
                 }
             }
         }
@@ -2364,27 +2766,55 @@ impl Composer {
     }
 }
 
-/// The factors of the glass that have a menu, with the way to read and write each.
-fn tune_params() -> [(&'static str, fn(&GlassTune) -> f32, fn(&mut GlassTune, f32)); 9] {
+/// What a row of the glass window changes: its name, how to read and write it, and the most it can be (a factor, in
+/// percent of 1, or an amount added to every layer's glass).
+type TuneRow = (&'static str, fn(&GlassTune) -> f32, fn(&mut GlassTune, f32), f32);
+
+/// The sliders of the glass window, in groups with a heading each.
+fn tune_groups() -> [(&'static str, Vec<TuneRow>); 5] {
     [
-        ("Specular", |t| t.specular, |t, v| t.specular = v),
-        ("Blur", |t| t.blur, |t, v| t.blur = v),
-        ("Refractivity", |t| t.refraction, |t, v| t.refraction = v),
-        ("Translucency", |t| t.translucency, |t, v| t.translucency = v),
-        ("Shadow", |t| t.shadow, |t, v| t.shadow = v),
-        ("Shadow reach", |t| t.shadow_dist, |t, v| t.shadow_dist = v),
-        ("Shadow softness", |t| t.shadow_soft, |t, v| t.shadow_soft = v),
-        ("Corners", |t| t.corner, |t, v| t.corner = v),
-        ("Sharpness", |t| t.sharp, |t, v| t.sharp = v),
+        ("Light", vec![
+            ("Specular", |t| t.specular, |t, v| t.specular = v, 2.0),
+            ("Edge line", |t| t.edge_line, |t, v| t.edge_line = v, 2.0),
+            ("Edge width", |t| t.edge_width, |t, v| t.edge_width = v, 4.0),
+            ("Edge sharpness", |t| t.edge_sharp, |t, v| t.edge_sharp = v, 4.0),
+            ("Soft light", |t| t.soft_light, |t, v| t.soft_light = v, 3.0),
+            ("Rim light", |t| t.rim, |t, v| t.rim = v, 3.0),
+            ("Sheen", |t| t.sheen, |t, v| t.sheen = v, 4.0),
+            ("Sharpness", |t| t.sharp, |t, v| t.sharp = v, 2.5),
+        ]),
+        ("Lens", vec![
+            ("Refractivity", |t| t.refraction, |t, v| t.refraction = v, 2.0),
+            ("Lens width", |t| t.lens_width, |t, v| t.lens_width = v, 3.0),
+            ("Dispersion", |t| t.dispersion, |t, v| t.dispersion = v, 4.0),
+            ("Own bending", |t| t.inner_bend, |t, v| t.inner_bend = v, 3.0),
+            ("Blur", |t| t.blur, |t, v| t.blur = v, 2.0),
+            ("Translucency", |t| t.translucency, |t, v| t.translucency = v, 2.0),
+        ]),
+        ("Depth", vec![
+            ("Bevel", |t| t.bevel, |t, v| t.bevel = v, 1.0),
+            ("Bevel width", |t| t.bevel_width, |t, v| t.bevel_width = v, 3.0),
+            ("Inner shadow", |t| t.inner_shadow, |t, v| t.inner_shadow = v, 1.0),
+            ("Glow", |t| t.glow, |t, v| t.glow = v, 1.0),
+        ]),
+        ("Shadow", vec![
+            ("Shadow", |t| t.shadow, |t, v| t.shadow = v, 2.0),
+            ("Shadow reach", |t| t.shadow_dist, |t, v| t.shadow_dist = v, 2.0),
+            ("Shadow softness", |t| t.shadow_soft, |t, v| t.shadow_soft = v, 3.0),
+        ]),
+        ("Shape", vec![("Corners", |t| t.corner, |t, v| t.corner = v, 2.0)]),
     ]
 }
 
 impl Composer {
     /// Where the glass window is, clamped to the window.
     fn glass_rect(&self, win: [f32; 4]) -> [f32; 4] {
-        let (w, h) = (340.0, 100.0 + 10.0 * 34.0 + 100.0);
+        // as tall as the sliders need, or as the window allows (the sliders scroll)
+        let w = 340.0;
+        let y = self.glass_pos[1].clamp(0.0, (win[3] - 200.0).max(0.0));
+        let h = (self.glass_height + 100.0 + 56.0).min(win[3] - y - 10.0).max(260.0);
         let x = if self.glass_pos[0] < 0.0 { win[2] - RIGHT_W - w - 14.0 } else { self.glass_pos[0] };
-        [x.clamp(0.0, (win[2] - w).max(0.0)), self.glass_pos[1].clamp(0.0, (win[3] - 60.0).max(0.0)), w, h]
+        [x.clamp(0.0, (win[2] - w).max(0.0)), y, w, h]
     }
 
     /// The window that floats over the editor with the presets and the sliders of the glass of every icon.
@@ -2424,21 +2854,45 @@ impl Composer {
         let mut t = before;
         let bw = (r[2] - 32.0 - 4.0 * 4.0) / 5.0;
         for (i, (name, preset)) in GLASS_PRESETS.iter().enumerate() {
-            if ui.button([r[0] + 16.0 + i as f32 * (bw + 4.0), r[1] + 52.0, bw, 28.0], name, t == *preset) {
-                t = *preset;
+            let preset = GlassTune { plate: before.plate, ..*preset };
+            if ui.button([r[0] + 16.0 + i as f32 * (bw + 4.0), r[1] + 52.0, bw, 28.0], name, t == preset) {
+                t = preset;
             }
         }
-        // the sliders
-        let mut f = Form::new(r[0] + 16.0, r[1] + 114.0, r[2] - 32.0, 34.0);
-        for (label, get, set) in tune_params() {
-            let mut pc = get(&t) * 100.0;
-            f.slider(ui, label, &mut pc, 0.0, 200.0, "%");
-            set(&mut t, pc / 100.0);
+        // the sliders scroll between the presets and the reset button; what is scrolled out takes no clicks
+        let list = [r[0], r[1] + 92.0, r[2], r[3] - 92.0 - 56.0];
+        let max_scroll = (self.glass_height - list[3] + 8.0).max(0.0);
+        if ui.scroll != 0.0 && inside(ui.mouse, list) {
+            self.glass_scroll += ui.scroll;
+        }
+        self.glass_scroll = self.glass_scroll.clamp(0.0, max_scroll);
+        let (mouse, click) = (ui.mouse, ui.click);
+        if !inside(ui.mouse, list) {
+            ui.mouse = [-1000.0; 2];
+            ui.click = false;
+        }
+        ui.push_clip(list);
+        let mut f = Form::new(r[0] + 16.0, list[1] + 14.0 - self.glass_scroll, r[2] - 32.0, 34.0);
+        let start = f.y;
+        for (title, rows) in tune_groups() {
+            f.note(ui, title, true);
+            for (label, get, set, max) in rows {
+                let mut pc = get(&t) * 100.0;
+                f.slider(ui, label, &mut pc, 0.0, max * 100.0, "%");
+                set(&mut t, pc / 100.0);
+            }
+            f.skip(6.0);
         }
         f.slider(ui, "Light from", &mut t.light, 0.0, 360.0, "°");
         // the clear looks in colour
         f.skip(4.0);
         f.toggle(ui, "Clear keeps colours", &mut t.colour_clear);
+        // the plate shape is global and only a view: no document keeps it
+        pick(ui, &mut f, "Plate", &mut t.plate, Shape::ALL, Shape::label);
+        self.glass_height = f.y - start + 14.0;
+        ui.pop_clip();
+        ui.mouse = mouse;
+        ui.click = click;
         let reset = [r[0] + 16.0, r[1] + r[3] - 44.0, r[2] - 32.0, 30.0];
         if ui.icon_button(reset, "rotate-ccw", "Reset the glass", false) {
             t = GlassTune::default();
@@ -2571,7 +3025,7 @@ impl Composer {
         let has_doc = self.doc.is_some();
         let has_pick = !self.picked().is_empty();
         let t = self.tune;
-        let mut glass: Vec<Item> = GLASS_PRESETS.iter().enumerate().map(|(i, (name, p))| Item::new(100 + i as u32, *name).checked(t == *p)).collect();
+        let mut glass: Vec<Item> = GLASS_PRESETS.iter().enumerate().map(|(i, (name, p))| Item::new(100 + i as u32, *name).checked(t == GlassTune { plate: t.plate, ..*p })).collect();
         glass.push(Item::sep());
         glass.push(Item::new(431, "Clear keeps the colours").checked(t.colour_clear));
         glass.push(Item::new(430, "Glass settings…").checked(self.glass_panel));
@@ -2590,7 +3044,28 @@ impl Composer {
                 Item::sep(),
                 Item::new(3, "Close").key("Ctrl+Q"),
             ]),
-            Menu::new("Edit", vec![
+            Menu::new("Edit", if self.drawing() {
+                let has = !self.vec.sel.is_empty();
+                vec![
+                    Item::new(10, "Undo").key("Ctrl+Z").enabled(!self.undo.is_empty()),
+                    Item::new(11, "Redo").key("Ctrl+Y").enabled(!self.redo.is_empty()),
+                    Item::sep(),
+                    Item::new(1054, "Cut").key("Ctrl+X").enabled(has),
+                    Item::new(1053, "Copy").key("Ctrl+C").enabled(has),
+                    Item::new(1050, "Paste").key("Ctrl+V"),
+                    Item::new(1030, "Duplicate").key("Ctrl+D").enabled(has),
+                    Item::new(1031, "Delete").key("Del").enabled(has),
+                    Item::new(1051, "Select all").key("Ctrl+A"),
+                    Item::sep(),
+                    Item::new(1010, "Simplify").enabled(has),
+                    Item::parent("Effects", vec![Item::new(1020, "Round corners"), Item::new(1022, "Roughen"), Item::new(1021, "Reverse direction")]),
+                    Item::sep(),
+                    Item::new(1036, "Flip horizontally").enabled(has),
+                    Item::new(1037, "Flip vertically").enabled(has),
+                    Item::new(1038, "Turn right").enabled(has),
+                    Item::new(1039, "Object to path").enabled(has),
+                ]
+            } else { vec![
                 Item::new(10, "Undo").key("Ctrl+Z").enabled(!self.undo.is_empty()),
                 Item::new(11, "Redo").key("Ctrl+Y").enabled(!self.redo.is_empty()),
                 Item::sep(),
@@ -2606,7 +3081,7 @@ impl Composer {
                 Item::sep(),
                 Item::new(20, "Back to original").enabled(has_doc),
                 Item::new(21, if self.confirm_reset_all { "Reset all icons: choose again to confirm" } else { "Reset all icons" }),
-            ]),
+            ] }),
             Menu::new("Glass", glass),
             Menu::new("View", vec![
                 Item::new(30, "Zoom in").enabled(self.zoom < 2.0),
@@ -2631,6 +3106,19 @@ impl Composer {
             3 => host.quit = true,
             10 => self.undo_step(),
             11 => self.redo_step(),
+            1000..=1099 => {
+                // from the shell's menu bar there is no click to keep the step of history, so it is kept here
+                let before = self.doc.clone();
+                self.vec.menu_action(id);
+                self.vec_clipboard(host);
+                if self.vec.dirty {
+                    if let Some(d) = before {
+                        self.undo.push(d);
+                        self.redo.clear();
+                    }
+                    self.vec_flush();
+                }
+            }
             12 | 13 | 14 | 15 => {
                 let picked = self.picked();
                 self.layer_action(&picked, match id { 12 => 5, 13 => 4, 14 => 2, _ => 3 });
@@ -2673,7 +3161,7 @@ impl Composer {
             }
             100..=199 => {
                 if let Some((_, p)) = GLASS_PRESETS.get((id - 100) as usize) {
-                    self.apply_tune(*p);
+                    self.apply_tune(GlassTune { plate: self.tune.plate, ..*p });
                 }
             }
             420 => self.apply_tune(GlassTune::default()),
@@ -2707,10 +3195,20 @@ impl App for Composer {
         let wake = waker.clone();
         std::thread::spawn(move || {
             let mut renderer = Renderer::new();
-            while let Ok(first) = job_rx.recv() {
+            // requests that arrived while the six looks were being drawn
+            let mut carry: Vec<Job> = Vec::new();
+            loop {
+                let first = if carry.is_empty() {
+                    match job_rx.recv() {
+                        Ok(j) => j,
+                        Err(_) => break,
+                    }
+                } else {
+                    carry.remove(0)
+                };
                 // only the newest request of each kind is worth drawing
                 let (mut one, mut grid) = (None, None);
-                for job in std::iter::once(first).chain(job_rx.try_iter()) {
+                for job in std::iter::once(first).chain(carry.drain(..)).chain(job_rx.try_iter()) {
                     if job.grid {
                         grid = Some(job);
                     } else {
@@ -2721,10 +3219,12 @@ impl App for Composer {
                     renderer.flat = job.flat;
                     renderer.tune = job.tune;
                     renderer.backdrop = job.backdrop;
+                    renderer.tint_by_icon = job.by_icon;
                     let img = renderer.render(&job.doc, job.look, job.n);
                     // the small copies are not on the wallpaper, so they are drawn without it
-                    let plain = renderer.backdrop.take().map(|_| renderer.render(&job.doc, job.look, 128));
-                    if done_tx.send(Done::One { version: job.version, look: job.look, img, plain }).is_err() {
+                    renderer.backdrop = None;
+                    let small = if job.small { small_copies(&mut renderer, &job.doc, job.look, job.px) } else { Vec::new() };
+                    if done_tx.send(Done::One { version: job.version, look: job.look, img, small }).is_err() {
                         break;
                     }
                     wake.wake();
@@ -2732,10 +3232,22 @@ impl App for Composer {
                 if let Some(job) = grid {
                     renderer.flat = job.flat;
                     renderer.tune = job.tune;
-                    let imgs = GRID_ORDER.iter().enumerate().map(|(k, l)| {
+                    let mut imgs = Vec::new();
+                    let mut stale = false;
+                    for (k, l) in GRID_ORDER.iter().enumerate() {
+                        // a newer request is waiting: the icon on the stage comes first, these looks are out of date anyway
+                        if let Ok(next) = job_rx.try_recv() {
+                            carry.push(next);
+                            stale = true;
+                            break;
+                        }
                         renderer.backdrop = job.behind.get(k).cloned();
-                        (*l, renderer.render(&job.doc, *l, GRID_N))
-                    }).collect();
+                        renderer.tint_by_icon = l.1;
+                        imgs.push((*l, renderer.render(&job.doc, l.0, GRID_N)));
+                    }
+                    if stale {
+                        continue;
+                    }
                     if done_tx.send(Done::Grid { version: job.version, imgs }).is_err() {
                         break;
                     }
@@ -2751,6 +3263,12 @@ impl App for Composer {
     /// The picker takes the keyboard while it is open: typing in its hex field, Ctrl+C / Ctrl+V / Ctrl+A, Enter and Esc.
     /// Without it Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) go through the history.
     fn raw_key(&mut self, event: &KeyEvent, mods: &Modifiers, _serial: u32, host: &mut Host) -> bool {
+        if self.vec_menu.is_some() && event.keysym == Keysym::Escape {
+            self.vec_menu = None;
+            self.menu_sub.clear();
+            host.redraw = true;
+            return true;
+        }
         if self.menu_open.is_none() && self.glass_panel && event.keysym == Keysym::Escape {
             self.glass_panel = false;
             host.redraw = true;
@@ -2773,6 +3291,20 @@ impl App for Composer {
             _ => event.keysym.key_char().map(|c| c.to_ascii_lowercase()),
         };
         let Some(pk) = self.picker.as_mut() else {
+            if self.drawing() && !(mods.ctrl && matches!(letter, Some('z') | Some('y'))) {
+                let before = self.doc.clone();
+                let used = self.vec.key(event.keysym, letter, mods);
+                self.vec_clipboard(host);
+                if self.vec.dirty {
+                    if let Some(d) = before {
+                        self.undo.push(d);
+                        self.redo.clear();
+                    }
+                    self.vec_flush();
+                }
+                host.redraw = true;
+                return used;
+            }
             // the arrow keys nudge the selected layer
             if let (false, Some(Sel::Node(id))) = (mods.ctrl, self.sel) {
                 let step = if mods.shift { 0.02 } else { 0.004 };
@@ -2877,8 +3409,43 @@ impl App for Composer {
         true
     }
 
+    fn raw_pointer(&mut self, event: &PointerEvt, _mods: &Modifiers, host: &mut Host) -> bool {
+        if !self.drawing() {
+            return false;
+        }
+        // the right button (BTN_RIGHT) opens the menu of the canvas
+        if let PointerKind::Press { button: 273, .. } = event.kind {
+            if self.vec_menu.is_some() {
+                self.vec_menu = None;
+                self.menu_sub.clear();
+                host.redraw = true;
+                return true;
+            }
+            if self.picker.is_none() && self.vec.contains(event.pos) {
+                let items = self.vec.context_items(event.pos);
+                self.vec_menu = Some((event.pos, items));
+                self.menu_sub.clear();
+                host.redraw = true;
+                return true;
+            }
+        }
+        false
+    }
+
     /// The text that Ctrl+V (or the paste button) brought: a colour code goes into the picker.
-    fn clipboard(&mut self, text: String, _host: &mut Host) {
+    fn clipboard(&mut self, text: String, host: &mut Host) {
+        if self.drawing() && self.picker.is_none() {
+            let before = self.doc.clone();
+            if self.vec.paste_svg(&text) || self.vec.paste_internal() {
+                if let Some(d) = before {
+                    self.undo.push(d);
+                    self.redo.clear();
+                }
+                self.vec_flush();
+                host.redraw = true;
+                return;
+            }
+        }
         let Some(c) = memrium_de::svgedit::parse_colour(text.split_whitespace().next().unwrap_or("")).or_else(|| parse_hex(text.trim())) else { return };
         if let Some(pk) = self.picker.as_mut() {
             pk.hsv = rgb_to_hsv(c);
@@ -2921,14 +3488,28 @@ impl App for Composer {
             };
         }
         // a picture is on its way: look again when it has arrived
-        let waiting = self.sent.is_some_and(|(v, l)| self.shown.as_ref().map_or(true, |s| s.version != v || s.look != l))
-            || (self.view == 1 && self.grid_sent.is_some_and(|v| self.grid.as_ref().map_or(true, |g| g.0 != v)));
+        let waiting = self.sent.is_some_and(|(v, l, _)| self.shown.as_ref().map_or(true, |s| s.version != v || s.look != l))
+            || self.grid_sent.is_some_and(|v| self.grid.as_ref().map_or(true, |g| g.0 != v));
         if waiting && self.results.is_some() {
             host.redraw = true;
         }
     }
 
     fn draw(&mut self, ui: &mut Ui<'_>, size: [f32; 2], host: &mut Host) {
+        if (host.scale - self.px_scale).abs() > 1e-3 && host.scale >= 1.0 {
+            self.px_scale = host.scale;
+            self.backdrop_key = None;
+            self.version += 1;
+            self.sent = None;
+        }
+        // the tinted looks follow the accent of the theme
+        if iconrender::tint() != ui.accent {
+            iconrender::set_tint(ui.accent);
+            self.version += 1;
+            self.thumbs.clear();
+            self.outline = None;
+            self.live_all_due = Some(std::time::Instant::now());
+        }
         let [w, h] = size;
         self.win = [0.0, 0.0, w, h];
         if self.backdrop == 3 {
@@ -2950,7 +3531,7 @@ impl App for Composer {
         let panel = self.picker_rect(size);
         let (mouse, click, scroll) = (ui.mouse, ui.click, ui.scroll);
         // an open menu takes the clicks: what is under it waits
-        let menu_modal = self.menu_open.is_some();
+        let menu_modal = self.menu_open.is_some() || self.vec_menu.is_some();
         let glass_rect = self.glass_panel.then(|| self.glass_rect(self.win));
         let over_glass = glass_rect.is_some_and(|g| inside(mouse, g)) || self.glass_grab.is_some();
         let over_picker = panel.is_some_and(|p| inside(mouse, p)) || menu_modal || over_glass;
@@ -2968,7 +3549,30 @@ impl App for Composer {
         };
         block(ui, over_picker || pick_mode);
         self.draw_left(ui, [0.0, top, LEFT_W, body_h]);
-        self.draw_inspector(ui, [w - RIGHT_W, top, RIGHT_W, body_h]);
+        {
+            // the settings of the layer, or of the shapes drawn in it: one panel, two tabs
+            let right = [w - RIGHT_W, top, RIGHT_W, body_h];
+            self.panel_bg(ui, right);
+            ui.fill([right[0], right[1], 1.0, right[3]], 0.0, ui.ink, 0.09);
+            let layer_picked = matches!(self.sel, Some(Sel::Node(id)) if self.doc.as_ref().and_then(|d| d.find(id)).is_some_and(|n| matches!(n.kind, Kind::Layer(_))));
+            let tabs = layer_picked || self.drawing();
+            let below = if tabs { [right[0], right[1] + 44.0, right[2], right[3] - 44.0] } else { right };
+            if self.drawing() {
+                self.draw_vec_inspector(ui, below);
+            } else {
+                self.draw_inspector(ui, below);
+            }
+            if tabs {
+                let mut tab = usize::from(self.drawing());
+                if ui.segmented([right[0] + 20.0, right[1] + 10.0, right[2] - 40.0, 28.0], &["Layer", "Shapes"], &mut tab) {
+                    if tab == 1 {
+                        self.start_drawing(vector::Tool::Select);
+                    } else {
+                        self.vec.set_tool(vector::Tool::Layer);
+                    }
+                }
+            }
+        }
         block(ui, over_picker);
         self.draw_stage(ui, [LEFT_W, top, w - LEFT_W - RIGHT_W, body_h]);
         block(ui, over_picker || pick_mode);
@@ -2988,6 +3592,7 @@ impl App for Composer {
         if !host.menu_bar {
             self.draw_menu_strip(ui, w, host);
         }
+        self.draw_vec_menu(ui, w, host);
         if let Some(panel) = self.picker_rect(size) {
             self.draw_picker(ui, panel, host);
         }
@@ -3010,9 +3615,20 @@ impl App for Composer {
 
 fn main() {
     let first = std::env::args().nth(1);
-    let mut composer = Composer::new(first);
+    // `--draw`: straight into the vector editor, on a new drawing
+    let draw_only = first.as_deref() == Some("--draw");
+    let mut composer = Composer::new(if draw_only { None } else { first });
+    if draw_only {
+        composer.start_drawing(vector::Tool::Rect);
+    }
     // the photo behind everything, as the glass is seen best over a picture
     composer.backdrop = 3;
+    if std::env::var_os("MEMRIUM_ICONS_DEMO").is_some() {
+        composer.sel = None;
+        composer.start_drawing(vector::Tool::Select);
+        composer.vec.demo();
+        composer.vec_flush();
+    }
     app::run(Config::new("Memrium Icons", "memrium-icons").size(1280, 700).min_size(1240, 600), composer);
 }
 
@@ -3353,8 +3969,8 @@ mod tests {
         r.frame();
         r.frame();
         let (_, pics) = r.app.grid.as_ref().expect("the six looks are drawn");
-        assert_eq!(pics.len(), 6);
-        assert_eq!(r.app.grid_rects.len(), 6);
+        assert_eq!(pics.len(), 7);
+        assert_eq!(r.app.grid_rects.len(), 7);
         // a change in the document is drawn again in the overview
         let first = r.app.grid.as_ref().unwrap().0;
         let id = r.app.doc.as_ref().unwrap().layers()[0].id;
@@ -3365,8 +3981,8 @@ mod tests {
         r.frame();
         assert!(r.app.grid.as_ref().unwrap().0 > first, "redrawn after the change");
         // a click on the last one makes it the look being edited and goes back to the editor
-        let (look, rect) = r.app.grid_rects[5];
-        assert_eq!(look, Appearance::TintedDark);
+        let (look, rect) = r.app.grid_rects[6];
+        assert_eq!(look.0, Appearance::TintedDark);
         r.click([rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0]);
         assert_eq!(r.app.look, Appearance::TintedDark);
         assert_eq!(r.app.view, 0);
@@ -3440,7 +4056,7 @@ mod tests {
         r.app.view = 1;
         r.frame();
         r.frame();
-        assert_eq!(r.app.grid.as_ref().unwrap().1.len(), 6);
+        assert_eq!(r.app.grid.as_ref().unwrap().1.len(), 7);
     }
 
     #[test]
@@ -3608,7 +4224,7 @@ mod tests {
         r.app.sel = Some(Sel::Node(id));
         r.frame();
         let mut p = r.app.props_of(id).unwrap();
-        p.gradient = Some(Gradient { a: [1.0, 0.0, 0.0], b: [0.0, 0.0, 1.0], angle: 90.0, radial: false });
+        p.gradient = Some(Gradient { a: [1.0, 0.0, 0.0], b: [0.0, 0.0, 1.0], angle: 90.0, ..Gradient::default() });
         p.glass = Glass { enabled: true, bevel: 0.8, inner_shadow: 0.3, glow: 0.2, ..Glass::default() };
         r.app.set_props(id, p);
         if let Ok(path) = std::env::var("GRAD_SHOT") {
@@ -3628,5 +4244,183 @@ mod tests {
         let loaded = icondoc::load(&icondoc::doc_path("firefox")).unwrap();
         let Kind::Layer(l) = &loaded.find(id).unwrap().kind else { panic!() };
         assert!(l.props.default.gradient.is_some());
+    }
+
+    /// A point of the icon on the stage: `fx`, `fy` are fractions of its square.
+    fn on_icon(r: &Rig, fx: f32, fy: f32) -> [f32; 2] {
+        let b = r.app.big_rect;
+        [b[0] + b[2] * fx, b[1] + b[3] * fy]
+    }
+
+    #[test]
+    fn drawing_tools_work_on_the_icon_and_undo_takes_a_shape_back() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        r.frame();
+        let layer = r.app.vec_layer.expect("a drawing layer");
+        let svg_of = |r: &Rig| match r.app.doc.as_ref().and_then(|d| d.find(layer)).map(|n| &n.kind) {
+            Some(Kind::Layer(l)) => l.svg.clone(),
+            _ => String::new(),
+        };
+        let (a, b) = (on_icon(&r, 0.25, 0.25), on_icon(&r, 0.55, 0.45));
+        drag_to(&mut r, a, b);
+        assert_eq!(r.app.vec.drawing.shapes.len(), 1);
+        assert!(svg_of(&r).contains("<rect"), "the layer holds the rectangle");
+        r.app.vec.set_tool(vector::Tool::Ellipse);
+        let (a, b) = (on_icon(&r, 0.5, 0.5), on_icon(&r, 0.8, 0.8));
+        drag_to(&mut r, a, b);
+        assert_eq!(r.app.vec.drawing.shapes.len(), 2);
+        // Undo takes the ellipse back and the editor follows the layer
+        r.key(Keysym::z, "z", true);
+        assert_eq!(r.app.vec.drawing.shapes.len(), 1);
+        // the layer tool is the old way: a click on the icon picks a layer
+        r.app.vec.set_tool(vector::Tool::Layer);
+        r.frame();
+        assert!(!r.app.drawing());
+    }
+
+    #[test]
+    fn every_drawing_tool_leaves_a_shape() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        r.frame();
+        let tools = [
+            (vector::Tool::Rect, (0.2, 0.2), (0.4, 0.35)),
+            (vector::Tool::Ellipse, (0.5, 0.2), (0.7, 0.35)),
+            (vector::Tool::Star, (0.3, 0.6), (0.3, 0.45)),
+            (vector::Tool::Line, (0.5, 0.5), (0.8, 0.65)),
+        ];
+        for (tool, a, b) in tools {
+            r.app.vec.set_tool(tool);
+            let (a, b) = (on_icon(&r, a.0, a.1), on_icon(&r, b.0, b.1));
+            drag_to(&mut r, a, b);
+        }
+        // freehand
+        r.app.vec.set_tool(vector::Tool::Pencil);
+        let start = on_icon(&r, 0.2, 0.8);
+        r.state.pointer_move(start);
+        r.frame();
+        r.state.pointer_down(start);
+        r.frame();
+        for k in 1..=30 {
+            r.state.pointer_move([start[0] + k as f32 * 6.0, start[1] + (k as f32 * 0.5).sin() * 20.0]);
+            r.frame();
+        }
+        r.state.pointer_up();
+        r.frame();
+        r.frame();
+        // the pen: a curve, then a straight node, finished with Enter
+        r.app.vec.set_tool(vector::Tool::Pen);
+        let p = on_icon(&r, 0.55, 0.85);
+        r.state.pointer_move(p);
+        r.frame();
+        r.state.pointer_down(p);
+        r.frame();
+        for k in 1..=4 {
+            r.state.pointer_move([p[0] + k as f32 * 8.0, p[1] - k as f32 * 8.0]);
+            r.frame();
+        }
+        r.state.pointer_up();
+        r.frame();
+        let q = on_icon(&r, 0.85, 0.85);
+        r.click(q);
+        r.key(Keysym::Return, "", false);
+        let kinds: Vec<&str> = r.app.vec.drawing.shapes.iter().map(|s| s.name.split(' ').next().unwrap_or("")).collect();
+        assert_eq!(kinds, ["Rectangle", "Ellipse", "Star", "Line", "Path", "Path"], "{kinds:?}");
+    }
+
+    #[test]
+    fn picking_the_background_goes_back_to_the_layer_tool_without_a_new_drawing() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        let layers = r.app.doc.as_ref().unwrap().nodes.len();
+        r.app.sel = Some(Sel::Background);
+        r.frame();
+        r.frame();
+        assert_eq!(r.app.doc.as_ref().unwrap().nodes.len(), layers);
+        assert!(!r.app.drawing(), "the layer tool is back");
+    }
+
+    #[test]
+    fn right_click_opens_the_menu_and_the_effects_and_clipboard_work() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        r.frame();
+        let (a, b) = (on_icon(&r, 0.3, 0.3), on_icon(&r, 0.6, 0.5));
+        drag_to(&mut r, a, b);
+        r.app.vec.set_tool(vector::Tool::Select);
+        let at = on_icon(&r, 0.45, 0.4);
+        let evt = PointerEvt { pos: at, kind: PointerKind::Press { button: 273, serial: 0 } };
+        assert!(r.app.raw_pointer(&evt, &Modifiers::default(), &mut r.host));
+        r.frame();
+        let items = r.app.vec_menu.as_ref().expect("a menu").1.clone();
+        assert!(items.iter().any(|i| i.label == "Effects"), "a shape has Effects");
+        r.app.vec.menu_action(1039);
+        r.app.vec.menu_action(1020);
+        let n = match &r.app.vec.drawing.shapes[0].geom {
+            vector::Geom::Path(s) => s[0].nodes.len(),
+            _ => 0,
+        };
+        assert_eq!(n, 8, "four corners became eight nodes");
+        r.app.vec.menu_action(1010);
+        r.app.vec.menu_action(1053);
+        let text = r.app.vec.want_copy.take().expect("svg text");
+        r.app.vec.paste_svg(&text);
+        assert_eq!(r.app.vec.drawing.shapes.len(), 2);
+        r.app.vec.menu_action(1054);
+        assert_eq!(r.app.vec.drawing.shapes.len(), 1);
+        assert!(r.app.vec.paste_internal());
+        assert_eq!(r.app.vec.drawing.shapes.len(), 2);
+        r.frame();
+    }
+
+    #[test]
+    fn a_picture_of_the_merged_mode() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        r.frame();
+        let (a, b) = (on_icon(&r, 0.2, 0.25), on_icon(&r, 0.8, 0.7));
+        drag_to(&mut r, a, b);
+        r.app.vec.set_tool(vector::Tool::Ellipse);
+        let (a, b) = (on_icon(&r, 0.35, 0.35), on_icon(&r, 0.65, 0.65));
+        drag_to(&mut r, a, b);
+        r.app.vec.set_tool(vector::Tool::Select);
+        r.frame();
+        r.frame();
+    }
+
+    #[test]
+    fn a_picture_of_a_blob_fill_with_rulers() {
+        let mut r = Rig::new();
+        r.app.sel = None;
+        r.app.start_drawing(vector::Tool::Rect);
+        r.frame();
+        r.frame();
+        let (a, b) = (on_icon(&r, 0.2, 0.25), on_icon(&r, 0.8, 0.7));
+        drag_to(&mut r, a, b);
+        r.app.vec.set_tool(vector::Tool::Select);
+        let id = r.app.vec.drawing.shapes[0].id;
+        r.app.vec.drawing.shapes[0].style.fill = vector::Fill::Blobs([0.1, 0.2, 0.8], Blobs::starter([0.1, 0.2, 0.8], [1.0, 0.5, 0.1]));
+        r.app.vec.sel = vec![id];
+        r.app.vec.touch();
+        r.frame();
+        r.frame();
+        assert!(r.app.vec.drawing.to_svg().contains("radialGradient"));
+        if let Ok(path) = std::env::var("BLOB_SHOT") {
+            std::env::set_var("TMP_SHOT", path);
+            r.frame();
+            r.frame();
+            std::env::remove_var("TMP_SHOT");
+        }
     }
 }
